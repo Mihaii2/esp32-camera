@@ -54,10 +54,10 @@ static camera_config_t camera_config = {
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_HD,         // 1280x720 Widescreen HD
-    .jpeg_quality = 10,                 // High JPEG clarity
-    .fb_count = 3,                      // Triple buffering pipeline
-    .fb_location = CAMERA_FB_IN_PSRAM,  // 8MB Octal PSRAM
+    .frame_size = FRAMESIZE_FHD,        // 1920x1080 (1080p Full HD)
+    .jpeg_quality = 12,                 // 10-14 is ideal for 1080p balance
+    .fb_count = 3,                      // Triple buffer in 8MB PSRAM
+    .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST,
 };
 
