@@ -7,6 +7,7 @@
 #include <esp_event.h>
 #include <esp_netif.h>
 #include <esp_http_server.h>
+#include <lwip/sockets.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -49,14 +50,14 @@ static camera_config_t camera_config = {
     .pin_href = CAM_PIN_HREF,
     .pin_pclk = CAM_PIN_PCLK,
 
-    .xclk_freq_hz = 24000000,           // 24MHz pixel clock
+    .xclk_freq_hz = 20000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_FHD,        // 1920x1080 (1080p Full HD)
-    .jpeg_quality = 12,                 // 10-14 is ideal for 1080p balance
-    .fb_count = 3,                      // Triple buffer in 8MB PSRAM
+    .frame_size = FRAMESIZE_SVGA,       // 800x600 sweet spot
+    .jpeg_quality = 10,                 // Sharp pixel clarity
+    .fb_count = 2,                      // Direct minimum-latency pipeline
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST,
 };
@@ -76,22 +77,20 @@ static void tune_sensor_quality(void)
     sensor_t *s = esp_camera_sensor_get();
     if (!s) return;
 
-    // Image enhancements
     s->set_brightness(s, 0);
     s->set_contrast(s, 1);
     s->set_saturation(s, 0);
     s->set_sharpness(s, 2);
 
-    // Auto Exposure & Auto White Balance
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
+    
     s->set_exposure_ctrl(s, 1);
-    s->set_aec2(s, 1);
+    s->set_aec2(s, 0);
     s->set_gain_ctrl(s, 1);
-    s->set_gainceiling(s, (gainceiling_t)GAINCEILING_2X);
+    s->set_gainceiling(s, (gainceiling_t)GAINCEILING_4X);
 
-    // Lens shading and denoising
     s->set_lenc(s, 1);
     s->set_bpc(s, 1);
     s->set_wpc(s, 1);
@@ -99,12 +98,19 @@ static void tune_sensor_quality(void)
 }
 #endif
 
-// HTTP Stream Handler
+// Non-blocking MJPEG stream handler
 static esp_err_t stream_handler(httpd_req_t *req)
 {
     camera_fb_t *fb = NULL;
     esp_err_t res = ESP_OK;
     char part_buf[64];
+    int sockfd = httpd_req_to_sockfd(req);
+
+    // Set socket send timeout to 1000ms to eliminate permanent deadlocks
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
 
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (res != ESP_OK) {
@@ -122,6 +128,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
         }
 
         size_t hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, fb->len);
+        
         res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
         if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, part_buf, hlen);
@@ -134,21 +141,26 @@ static esp_err_t stream_handler(httpd_req_t *req)
         fb = NULL;
 
         if (res != ESP_OK) {
+            ESP_LOGW(TAG, "Client disconnected / socket write timeout");
             break;
         }
+
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     return res;
 }
 
-// Start HTTP Server
 static httpd_handle_t start_webserver(void)
 {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.ctrl_port = 32768;
+    config.stack_size = 8192;
+    config.task_priority = 5;
+    config.max_open_sockets = 4;
+    config.lru_purge_enable = true;
 
     httpd_uri_t stream_uri = {
         .uri       = "/",
@@ -167,7 +179,6 @@ static httpd_handle_t start_webserver(void)
     return NULL;
 }
 
-// Wi-Fi Event Handler
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data)
 {
@@ -185,7 +196,6 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-// Wi-Fi Initialization
 static void wifi_init_sta(void)
 {
     s_wifi_event_group = xEventGroupCreate();
@@ -221,8 +231,6 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-
-    // Disable Wi-Fi power-save sleep for maximum network throughput
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     ESP_LOGI(TAG, "Connecting to hotspot '%s'...", WIFI_SSID);
