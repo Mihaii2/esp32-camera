@@ -3,21 +3,31 @@
 #include <esp_system.h>
 #include <nvs_flash.h>
 #include <string.h>
+#include <esp_wifi.h>
+#include <esp_event.h>
+#include <esp_netif.h>
+#include <esp_http_server.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/uart.h"
-
-#ifndef portTICK_RATE_MS
-#define portTICK_RATE_MS portTICK_PERIOD_MS
-#endif
+#include "freertos/event_groups.h"
 
 #include "esp_camera.h"
 
 #define BOARD_ESP32S3_GOOUUU 1
 #include "camera_pinout.h"
 
-static const char *TAG = "live_stream";
+#define WIFI_SSID      "laptop_flipper"
+#define WIFI_PASS      "mafiosu123"
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+static const char *TAG = "wifi_camera_stream";
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
 
 #if ESP_CAMERA_SUPPORTED
 static camera_config_t camera_config = {
@@ -39,13 +49,13 @@ static camera_config_t camera_config = {
     .pin_href = CAM_PIN_HREF,
     .pin_pclk = CAM_PIN_PCLK,
 
-    .xclk_freq_hz = 10000000,          // 10MHz prevents sensor timing jitter
+    .xclk_freq_hz = 10000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_QVGA,       // 320x240
-    .jpeg_quality = 14,                // Leaner JPEG for fast transmission
+    .frame_size = FRAMESIZE_VGA,        // 640x480 (Smooth over Wi-Fi)
+    .jpeg_quality = 12,
     .fb_count = 1,
     .fb_location = CAMERA_FB_IN_DRAM,
     .grab_mode = CAMERA_GRAB_LATEST,
@@ -62,41 +72,153 @@ static esp_err_t init_camera(void)
 }
 #endif
 
+// HTTP Stream Handler
+static esp_err_t stream_handler(httpd_req_t *req)
+{
+    camera_fb_t *fb = NULL;
+    esp_err_t res = ESP_OK;
+    char part_buf[64];
+
+    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+    if (res != ESP_OK) {
+        return res;
+    }
+
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    while (true) {
+        fb = esp_camera_fb_get();
+        if (!fb) {
+            ESP_LOGE(TAG, "Camera capture failed");
+            res = ESP_FAIL;
+            break;
+        }
+
+        size_t hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, fb->len);
+        res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+        if (res == ESP_OK) {
+            res = httpd_resp_send_chunk(req, part_buf, hlen);
+        }
+        if (res == ESP_OK) {
+            res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+        }
+        
+        esp_camera_fb_return(fb);
+        fb = NULL;
+
+        if (res != ESP_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    return res;
+}
+
+// Start HTTP Server
+static httpd_handle_t start_webserver(void)
+{
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.ctrl_port = 32768;
+
+    httpd_uri_t stream_uri = {
+        .uri       = "/",
+        .method    = HTTP_GET,
+        .handler   = stream_handler,
+        .user_ctx  = NULL
+    };
+
+    ESP_LOGI(TAG, "Starting HTTP server on port: '%d'", config.server_port);
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_register_uri_handler(server, &stream_uri);
+        return server;
+    }
+
+    ESP_LOGI(TAG, "Error starting server!");
+    return NULL;
+}
+
+// Wi-Fi Event Handler
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGI(TAG, "Disconnected from Wi-Fi, reconnecting...");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "==================================================");
+        ESP_LOGI(TAG, "CONNECTED! Stream URL: http://" IPSTR "/", IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "==================================================");
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+// Wi-Fi Initialization (Station Mode)
+static void wifi_init_sta(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "Connecting to hotspot '%s'...", WIFI_SSID);
+}
+
 void app_main(void)
 {
+    // Initialize NVS (Required for Wi-Fi)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
 #if ESP_CAMERA_SUPPORTED
-    esp_log_level_set("*", ESP_LOG_NONE);
-
-    // Standard high-speed reliable baud: 921600
-    uart_config_t uart_config = {
-        .baud_rate = 921600,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
-    };
-    uart_param_config(UART_NUM_0, &uart_config);
-    uart_driver_install(UART_NUM_0, 4096, 0, 0, NULL, 0);
-
     if (ESP_OK != init_camera()) {
         return;
     }
 
-    const uint8_t header[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    wifi_init_sta();
 
-    while (1) {
-        camera_fb_t *pic = esp_camera_fb_get();
-        if (pic) {
-            // Verify valid JPEG SOI marker (0xFF 0xD8) before sending
-            if (pic->len > 4 && pic->buf[0] == 0xFF && pic->buf[1] == 0xD8) {
-                uint32_t size = pic->len;
-                uart_write_bytes(UART_NUM_0, (const char *)header, 4);
-                uart_write_bytes(UART_NUM_0, (const char *)&size, 4);
-                uart_write_bytes(UART_NUM_0, (const char *)pic->buf, pic->len);
-            }
-            esp_camera_fb_return(pic);
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    // Wait until Wi-Fi connection gets an IP address
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+
+    // Start HTTP Web Server
+    start_webserver();
 #endif
 }

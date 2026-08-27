@@ -1,3 +1,3 @@
 idf_component_register(SRCS "take_picture.c"
                        INCLUDE_DIRS "."
-                       REQUIRES esp32-camera esp_http_server esp_wifi nvs_flash esp_event)
+                       PRIV_REQUIRES esp_http_server esp_wifi esp_netif nvs_flash)
