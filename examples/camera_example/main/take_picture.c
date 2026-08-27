@@ -49,15 +49,15 @@ static camera_config_t camera_config = {
     .pin_href = CAM_PIN_HREF,
     .pin_pclk = CAM_PIN_PCLK,
 
-    .xclk_freq_hz = 20000000,
+    .xclk_freq_hz = 24000000,           // 24MHz pixel clock
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_SVGA,       // 800x600 high quality
-    .jpeg_quality = 10,                 // High sharpness (lower = crisper)
-    .fb_count = 2,                      // Double-buffering enabled by PSRAM
-    .fb_location = CAMERA_FB_IN_PSRAM,  // Buffers allocated in 8MB PSRAM
+    .frame_size = FRAMESIZE_HD,         // 1280x720 Widescreen HD
+    .jpeg_quality = 10,                 // High JPEG clarity
+    .fb_count = 3,                      // Triple buffering pipeline
+    .fb_location = CAMERA_FB_IN_PSRAM,  // 8MB Octal PSRAM
     .grab_mode = CAMERA_GRAB_LATEST,
 };
 
@@ -76,7 +76,7 @@ static void tune_sensor_quality(void)
     sensor_t *s = esp_camera_sensor_get();
     if (!s) return;
 
-    // Sharpness and contrast
+    // Image enhancements
     s->set_brightness(s, 0);
     s->set_contrast(s, 1);
     s->set_saturation(s, 0);
@@ -222,7 +222,7 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Disable Wi-Fi power-save sleep to prevent frame drops
+    // Disable Wi-Fi power-save sleep for maximum network throughput
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     ESP_LOGI(TAG, "Connecting to hotspot '%s'...", WIFI_SSID);
