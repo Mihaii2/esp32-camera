@@ -49,15 +49,15 @@ static camera_config_t camera_config = {
     .pin_href = CAM_PIN_HREF,
     .pin_pclk = CAM_PIN_PCLK,
 
-    .xclk_freq_hz = 10000000,
+    .xclk_freq_hz = 20000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_VGA,        // 640x480 (Smooth over Wi-Fi)
-    .jpeg_quality = 12,
-    .fb_count = 1,
-    .fb_location = CAMERA_FB_IN_DRAM,
+    .frame_size = FRAMESIZE_SVGA,       // 800x600 high quality
+    .jpeg_quality = 10,                 // High sharpness (lower = crisper)
+    .fb_count = 2,                      // Double-buffering enabled by PSRAM
+    .fb_location = CAMERA_FB_IN_PSRAM,  // Buffers allocated in 8MB PSRAM
     .grab_mode = CAMERA_GRAB_LATEST,
 };
 
@@ -69,6 +69,33 @@ static esp_err_t init_camera(void)
         return err;
     }
     return ESP_OK;
+}
+
+static void tune_sensor_quality(void)
+{
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s) return;
+
+    // Sharpness and contrast
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 1);
+    s->set_saturation(s, 0);
+    s->set_sharpness(s, 2);
+
+    // Auto Exposure & Auto White Balance
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_wb_mode(s, 0);
+    s->set_exposure_ctrl(s, 1);
+    s->set_aec2(s, 1);
+    s->set_gain_ctrl(s, 1);
+    s->set_gainceiling(s, (gainceiling_t)GAINCEILING_2X);
+
+    // Lens shading and denoising
+    s->set_lenc(s, 1);
+    s->set_bpc(s, 1);
+    s->set_wpc(s, 1);
+    s->set_raw_gma(s, 1);
 }
 #endif
 
@@ -102,7 +129,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
         if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
         }
-        
+
         esp_camera_fb_return(fb);
         fb = NULL;
 
@@ -136,7 +163,7 @@ static httpd_handle_t start_webserver(void)
         return server;
     }
 
-    ESP_LOGI(TAG, "Error starting server!");
+    ESP_LOGE(TAG, "Error starting server!");
     return NULL;
 }
 
@@ -158,7 +185,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-// Wi-Fi Initialization (Station Mode)
+// Wi-Fi Initialization
 static void wifi_init_sta(void)
 {
     s_wifi_event_group = xEventGroupCreate();
@@ -195,12 +222,14 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // Disable Wi-Fi power-save sleep to prevent frame drops
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
     ESP_LOGI(TAG, "Connecting to hotspot '%s'...", WIFI_SSID);
 }
 
 void app_main(void)
 {
-    // Initialize NVS (Required for Wi-Fi)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -208,17 +237,19 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    ESP_LOGI(TAG, "Total Free Internal DRAM: %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "Total Free PSRAM/SPIRAM:  %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
 #if ESP_CAMERA_SUPPORTED
     if (ESP_OK != init_camera()) {
         return;
     }
 
+    tune_sensor_quality();
     wifi_init_sta();
 
-    // Wait until Wi-Fi connection gets an IP address
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
 
-    // Start HTTP Web Server
     start_webserver();
 #endif
 }
