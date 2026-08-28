@@ -55,9 +55,9 @@ static camera_config_t camera_config = {
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_SVGA,       // 800x600 sweet spot
-    .jpeg_quality = 10,                 // Sharp pixel clarity
-    .fb_count = 2,                      // Direct minimum-latency pipeline
+    .frame_size = FRAMESIZE_QXGA,       // 2048x1536 (Full 3.15MP native matrix)
+    .jpeg_quality = 8,                  // Minimum compression for max edge sharpness
+    .fb_count = 2,
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST,
 };
@@ -80,7 +80,7 @@ static void tune_sensor_quality(void)
     s->set_brightness(s, 0);
     s->set_contrast(s, 1);
     s->set_saturation(s, 0);
-    s->set_sharpness(s, 2);
+    s->set_sharpness(s, 0);             // Raw sharpness for unskewed focus measurement
 
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
@@ -106,7 +106,6 @@ static esp_err_t stream_handler(httpd_req_t *req)
     char part_buf[64];
     int sockfd = httpd_req_to_sockfd(req);
 
-    // Set socket send timeout to 1000ms to eliminate permanent deadlocks
     struct timeval tv;
     tv.tv_sec = 1;
     tv.tv_usec = 0;
