@@ -50,14 +50,14 @@ static camera_config_t camera_config = {
     .pin_href = CAM_PIN_HREF,
     .pin_pclk = CAM_PIN_PCLK,
 
-    .xclk_freq_hz = 20000000,
+    .xclk_freq_hz = 24000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_QXGA,       // 2048x1536 (Full 3.15MP native matrix)
-    .jpeg_quality = 8,                  // Minimum compression for max edge sharpness
-    .fb_count = 2,
+    .frame_size = FRAMESIZE_SVGA,       // 800x600 sweet spot
+    .jpeg_quality = 14,                 // Leaner payload absorbs hotspot beacon stalls
+    .fb_count = 3,
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST,
 };
@@ -69,6 +69,14 @@ static esp_err_t init_camera(void)
         ESP_LOGE(TAG, "Camera Init Failed: 0x%x", err);
         return err;
     }
+
+    for (int i = 0; i < 4; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            esp_camera_fb_return(fb);
+        }
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
     return ESP_OK;
 }
 
@@ -77,17 +85,25 @@ static void tune_sensor_quality(void)
     sensor_t *s = esp_camera_sensor_get();
     if (!s) return;
 
-    s->set_brightness(s, 0);
-    s->set_contrast(s, 1);
-    s->set_saturation(s, 0);
-    s->set_sharpness(s, 0);             // Raw sharpness for unskewed focus measurement
+    // Normal vertical, flipped horizontal (correct mirror orientation)
+    s->set_vflip(s, 0);
+    s->set_hmirror(s, 1);
 
+    // Color & Detail
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+    s->set_sharpness(s, 2);
+
+    // Auto White Balance
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
-    
+
+    // Lock exposure loop
     s->set_exposure_ctrl(s, 1);
     s->set_aec2(s, 0);
+    s->set_ae_level(s, 0);
     s->set_gain_ctrl(s, 1);
     s->set_gainceiling(s, (gainceiling_t)GAINCEILING_4X);
 
@@ -98,7 +114,6 @@ static void tune_sensor_quality(void)
 }
 #endif
 
-// Non-blocking MJPEG stream handler
 static esp_err_t stream_handler(httpd_req_t *req)
 {
     camera_fb_t *fb = NULL;
@@ -106,9 +121,10 @@ static esp_err_t stream_handler(httpd_req_t *req)
     char part_buf[64];
     int sockfd = httpd_req_to_sockfd(req);
 
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
+    int nodelay = 1;
+    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (const void *)&nodelay, sizeof(nodelay));
+
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
     setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
 
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
@@ -127,7 +143,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
         }
 
         size_t hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, fb->len);
-        
+
         res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
         if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, part_buf, hlen);
@@ -140,11 +156,10 @@ static esp_err_t stream_handler(httpd_req_t *req)
         fb = NULL;
 
         if (res != ESP_OK) {
-            ESP_LOGW(TAG, "Client disconnected / socket write timeout");
             break;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1));
+        taskYIELD();
     }
 
     return res;
@@ -157,8 +172,9 @@ static httpd_handle_t start_webserver(void)
     config.server_port = 80;
     config.ctrl_port = 32768;
     config.stack_size = 8192;
-    config.task_priority = 5;
-    config.max_open_sockets = 4;
+    config.task_priority = 6;          // Bumped priority above standard background tasks
+    config.core_id = 1;
+    config.max_open_sockets = 2;
     config.lru_purge_enable = true;
 
     httpd_uri_t stream_uri = {
@@ -168,7 +184,7 @@ static httpd_handle_t start_webserver(void)
         .user_ctx  = NULL
     };
 
-    ESP_LOGI(TAG, "Starting HTTP server on port: '%d'", config.server_port);
+    ESP_LOGI(TAG, "Starting HTTP server on port: '%d' on Core %d", config.server_port, config.core_id);
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &stream_uri);
         return server;
@@ -183,6 +199,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        ESP_LOGI(TAG, "Wi-Fi associated: Disabled modem sleep");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG, "Disconnected from Wi-Fi, reconnecting...");
         esp_wifi_connect();
@@ -191,6 +210,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "==================================================");
         ESP_LOGI(TAG, "CONNECTED! Stream URL: http://" IPSTR "/", IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "==================================================");
+
+        esp_wifi_set_ps(WIFI_PS_NONE);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -208,29 +229,24 @@ static void wifi_init_sta(void)
 
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
 
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = WIFI_SSID,
             .password = WIFI_PASS,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .listen_interval = 0,
         },
     };
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
 
     ESP_LOGI(TAG, "Connecting to hotspot '%s'...", WIFI_SSID);
 }
@@ -247,16 +263,15 @@ void app_main(void)
     ESP_LOGI(TAG, "Total Free Internal DRAM: %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     ESP_LOGI(TAG, "Total Free PSRAM/SPIRAM:  %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
+    wifi_init_sta();
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+
 #if ESP_CAMERA_SUPPORTED
     if (ESP_OK != init_camera()) {
         return;
     }
 
     tune_sensor_quality();
-    wifi_init_sta();
-
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-
     start_webserver();
 #endif
 }
