@@ -56,8 +56,8 @@ static camera_config_t camera_config = {
 
     .pixel_format = PIXFORMAT_JPEG,
     .frame_size = FRAMESIZE_SVGA,       // 800x600 sweet spot
-    .jpeg_quality = 14,                 // Leaner payload absorbs hotspot beacon stalls
-    .fb_count = 3,
+    .jpeg_quality = 12,
+    .fb_count = 2,                      // Direct dual buffer: latest live frame always
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST,
 };
@@ -70,6 +70,7 @@ static esp_err_t init_camera(void)
         return err;
     }
 
+    // Flush initial frame DMA buffers
     for (int i = 0; i < 4; i++) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
@@ -85,14 +86,14 @@ static void tune_sensor_quality(void)
     sensor_t *s = esp_camera_sensor_get();
     if (!s) return;
 
-    // Normal vertical, flipped horizontal (correct mirror orientation)
+    // Correct orientation
     s->set_vflip(s, 0);
     s->set_hmirror(s, 1);
 
-    // Color & Detail
-    s->set_brightness(s, 0);
-    s->set_contrast(s, 0);
-    s->set_saturation(s, 0);
+    // Color & Contrast: Lift midtones out of the gloomy dark look
+    s->set_brightness(s, 1);            // Boost base exposure level
+    s->set_contrast(s, 1);              // Punchier edges
+    s->set_saturation(s, 1);            // Vibrant natural color
     s->set_sharpness(s, 2);
 
     // Auto White Balance
@@ -100,20 +101,23 @@ static void tune_sensor_quality(void)
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
 
-    // Lock exposure loop
+    // Dynamic Range / Exposure Fix:
+    // Stops the lamp from crushing the whole frame to black
     s->set_exposure_ctrl(s, 1);
-    s->set_aec2(s, 0);
-    s->set_ae_level(s, 0);
+    s->set_aec2(s, 0);                  // Disable secondary AEC (avoids strobe hunting)
+    s->set_ae_level(s, 2);              // Strongly bias exposure brighter (+2)
     s->set_gain_ctrl(s, 1);
-    s->set_gainceiling(s, (gainceiling_t)GAINCEILING_4X);
+    s->set_gainceiling(s, (gainceiling_t)GAINCEILING_16X); // Lift shadowed room details
 
-    s->set_lenc(s, 1);
+    // Gamma curve & noise reduction
+    s->set_raw_gma(s, 1);               // Dynamic gamma curves lift shadows
+    s->set_lenc(s, 1);                  // Vignette correction
     s->set_bpc(s, 1);
     s->set_wpc(s, 1);
-    s->set_raw_gma(s, 1);
 }
 #endif
 
+// Non-blocking, zero-stall MJPEG handler
 static esp_err_t stream_handler(httpd_req_t *req)
 {
     camera_fb_t *fb = NULL;
@@ -121,10 +125,12 @@ static esp_err_t stream_handler(httpd_req_t *req)
     char part_buf[64];
     int sockfd = httpd_req_to_sockfd(req);
 
+    // TCP_NODELAY: Push immediately, never wait to aggregate
     int nodelay = 1;
     setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (const void *)&nodelay, sizeof(nodelay));
 
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
+    // Send timeout: Drop frame immediately if Wi-Fi has a hiccup
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 250000 };
     setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
 
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
@@ -156,6 +162,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
         fb = NULL;
 
         if (res != ESP_OK) {
+            ESP_LOGW(TAG, "Socket write failed / client dropped");
             break;
         }
 
@@ -171,9 +178,9 @@ static httpd_handle_t start_webserver(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.ctrl_port = 32768;
-    config.stack_size = 8192;
-    config.task_priority = 6;          // Bumped priority above standard background tasks
-    config.core_id = 1;
+    config.stack_size = 10240;
+    config.task_priority = 6;
+    config.core_id = 1;                 // Dedicated Core 1 execution
     config.max_open_sockets = 2;
     config.lru_purge_enable = true;
 
@@ -201,7 +208,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
         esp_wifi_set_ps(WIFI_PS_NONE);
-        ESP_LOGI(TAG, "Wi-Fi associated: Disabled modem sleep");
+        ESP_LOGI(TAG, "Wi-Fi associated: Disabled modem sleep (WIFI_PS_NONE)");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG, "Disconnected from Wi-Fi, reconnecting...");
         esp_wifi_connect();
@@ -236,7 +243,12 @@ static void wifi_init_sta(void)
         .sta = {
             .ssid = WIFI_SSID,
             .password = WIFI_PASS,
+            // Lock to standard WPA2-PSK to eliminate WPA3-SAE re-keying freezes
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = false,
+                .required = false
+            },
             .listen_interval = 0,
         },
     };
@@ -245,6 +257,8 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // Max RF output power (78 = 19.5 dBm max) & disable sleep
+    esp_wifi_set_max_tx_power(78);
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
 
@@ -263,15 +277,18 @@ void app_main(void)
     ESP_LOGI(TAG, "Total Free Internal DRAM: %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     ESP_LOGI(TAG, "Total Free PSRAM/SPIRAM:  %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    wifi_init_sta();
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-
 #if ESP_CAMERA_SUPPORTED
     if (ESP_OK != init_camera()) {
         return;
     }
 
     tune_sensor_quality();
+#endif
+
+    wifi_init_sta();
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+
+#if ESP_CAMERA_SUPPORTED
     start_webserver();
 #endif
 }
