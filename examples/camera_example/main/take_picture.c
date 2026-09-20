@@ -28,7 +28,7 @@
 #include "camera_pinout.h"
 
 /* ============================================================
- * WIFI CONFIGURATION (Hotspot)
+ * WIFI CONFIGURATION (Redmi Note 13 Pro Hotspot)
  * ============================================================ */
 
 #define WIFI_SSID      "My_Redmi"
@@ -36,7 +36,7 @@
 
 #define WIFI_CONNECTED_BIT BIT0
 
-static const char *TAG = "CAM_STREAM";
+static const char *TAG = "wifi_camera_stream";
 static EventGroupHandle_t s_wifi_event_group;
 
 /* ============================================================
@@ -48,10 +48,18 @@ static EventGroupHandle_t s_wifi_event_group;
 static const char *STREAM_CONTENT_TYPE =
     "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 
+static const char *STREAM_BOUNDARY =
+    "\r\n--" PART_BOUNDARY "\r\n";
+
+static const char *STREAM_PART =
+    "Content-Type: image/jpeg\r\n"
+    "Content-Length: %u\r\n\r\n";
+
 /* ============================================================
- * CAMERA CONFIGURATION
+ * CAMERA CONFIGURATION (SVGA 800x600, 24MHz, Dual Buffer)
  * ============================================================ */
 
+#if ESP_CAMERA_SUPPORTED
 static camera_config_t camera_config = {
     .pin_pwdn = CAM_PIN_PWDN,
     .pin_reset = CAM_PIN_RESET,
@@ -79,21 +87,17 @@ static camera_config_t camera_config = {
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_QVGA,   // 320x240 for minimum jitter
-    .jpeg_quality = 12,              // Balance between sharp pixels and packet size
+    .frame_size = FRAMESIZE_SVGA,       // 800x600 resolution
+    .jpeg_quality = 12,
 
-    .fb_count = 2,
+    .fb_count = 2,                      // Dual-buffer: always grabs freshest frame
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST,
 };
 
-/* ============================================================
- * CAMERA INITIALIZATION & TUNING
- * ============================================================ */
-
 static esp_err_t init_camera(void)
 {
-    ESP_LOGI(TAG, "Initializare camera...");
+    ESP_LOGI(TAG, "Initializare camera hardware (SVGA 800x600)...");
 
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK) {
@@ -101,53 +105,56 @@ static esp_err_t init_camera(void)
         return err;
     }
 
-    ESP_LOGI(TAG, "Camera initializata cu succes.");
-
+    // Flush initial frame DMA buffers
     for (int i = 0; i < 4; i++) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
             esp_camera_fb_return(fb);
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(15));
     }
 
+    ESP_LOGI(TAG, "Camera initializata cu succes.");
     return ESP_OK;
 }
 
 static void tune_sensor_quality(void)
 {
     sensor_t *s = esp_camera_sensor_get();
-    if (!s) {
-        ESP_LOGW(TAG, "Nu am putut obtine sensor_t.");
-        return;
-    }
+    if (!s) return;
 
+    // Correct orientation
     s->set_vflip(s, 0);
     s->set_hmirror(s, 1);
 
-    s->set_brightness(s, 1);
-    s->set_contrast(s, 1);
-    s->set_saturation(s, 1);
+    // Color & Contrast: Lift midtones out of the gloomy dark look
+    s->set_brightness(s, 1);            // Boost base exposure level
+    s->set_contrast(s, 1);              // Punchier edges
+    s->set_saturation(s, 1);            // Vibrant natural color
     s->set_sharpness(s, 2);
 
+    // Auto White Balance
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
 
+    // Dynamic Range / Exposure Fix:
+    // Stops the lamp from crushing the whole frame to black
     s->set_exposure_ctrl(s, 1);
-    s->set_aec2(s, 0);
-    s->set_ae_level(s, 2);
-
+    s->set_aec2(s, 0);                  // Disable secondary AEC (avoids strobe hunting)
+    s->set_ae_level(s, 2);              // Strongly bias exposure brighter (+2)
     s->set_gain_ctrl(s, 1);
-    s->set_gainceiling(s, (gainceiling_t)GAINCEILING_16X);
+    s->set_gainceiling(s, (gainceiling_t)GAINCEILING_16X); // Lift shadowed room details
 
-    s->set_raw_gma(s, 1);
-    s->set_lenc(s, 1);
+    // Gamma curve & noise reduction
+    s->set_raw_gma(s, 1);               // Dynamic gamma curves lift shadows
+    s->set_lenc(s, 1);                  // Vignette correction
     s->set_bpc(s, 1);
     s->set_wpc(s, 1);
 
-    ESP_LOGI(TAG, "Setari senzor aplicate.");
+    ESP_LOGI(TAG, "Sensor tuning aplicat cu succes!");
 }
+#endif
 
 /* ============================================================
  * LOW-LATENCY STREAM HANDLER WITH TELEMETRY
@@ -159,11 +166,14 @@ static esp_err_t stream_handler(httpd_req_t *req)
     esp_err_t res = ESP_OK;
     char part_buf[128];
 
-    // Disable Nagle's algorithm on the active socket to prevent stuttering
     int sockfd = httpd_req_to_sockfd(req);
     if (sockfd >= 0) {
         int nodelay = 1;
-        setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (void *)&nodelay, sizeof(int));
+        setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (const void *)&nodelay, sizeof(nodelay));
+
+        // Send timeout: Drop frame immediately if Wi-Fi has a hiccup
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 250000 };
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
     }
 
     res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
@@ -198,15 +208,14 @@ static esp_err_t stream_handler(httpd_req_t *req)
             break;
         }
 
-        size_t hlen = snprintf(part_buf, sizeof(part_buf),
-                               "\r\n--" PART_BOUNDARY "\r\n"
-                               "Content-Type: image/jpeg\r\n"
-                               "Content-Length: %u\r\n\r\n",
-                               (unsigned)fb->len);
+        size_t hlen = snprintf(part_buf, sizeof(part_buf), STREAM_PART, (unsigned)fb->len);
 
         int64_t t_send_start = esp_timer_get_time();
 
-        res = httpd_resp_send_chunk(req, part_buf, hlen);
+        res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
+        if (res == ESP_OK) {
+            res = httpd_resp_send_chunk(req, part_buf, hlen);
+        }
         if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
         }
@@ -218,11 +227,11 @@ static esp_err_t stream_handler(httpd_req_t *req)
         fb = NULL;
 
         if (res != ESP_OK) {
-            ESP_LOGW(TAG, "Client deconectat (err=0x%x).", res);
+            ESP_LOGW(TAG, "Socket write failed / client dropped (err=0x%x)", res);
             break;
         }
 
-        // Compute frame gap and update telemetry
+        // Telemetry calculation
         int64_t t_now = esp_timer_get_time();
         int64_t gap_us = t_now - t_prev_frame;
         t_prev_frame = t_now;
@@ -236,11 +245,11 @@ static esp_err_t stream_handler(httpd_req_t *req)
         if (gap_us > win_max_gap_us) {
             win_max_gap_us = gap_us;
         }
-        if (gap_us > 80000) { // More than 80ms gap
+        if (gap_us > 80000) {
             win_stutters++;
         }
 
-        // Print stats to Serial every 5 seconds (matching Python interval)
+        // Output matching 5-second stats to terminal
         if (t_now - t_stats_window >= 5000000) {
             float elapsed_sec = (float)(t_now - t_stats_window) / 1000000.0f;
             float fps = (float)win_frames / elapsed_sec;
@@ -253,7 +262,6 @@ static esp_err_t stream_handler(httpd_req_t *req)
             ESP_LOGI(TAG, "[5s Stats] FPS: %4.1f | AvgGap: %4.1fms | MaxFreeze: %4.0fms | Drops>80ms: %2lu | Cap: %3.1fms | Send: %3.1fms | %5.0f kbps",
                      fps, avg_gap_ms, max_gap_ms, (unsigned long)win_stutters, avg_cap_ms, avg_send_ms, kbps);
 
-            // Reset 5s tracking window
             t_stats_window = t_now;
             win_frames = 0;
             win_bytes = 0;
@@ -287,6 +295,7 @@ static httpd_handle_t start_webserver(void)
     config.core_id = 1;
     config.max_open_sockets = 2;
     config.lru_purge_enable = true;
+    config.send_wait_timeout = 1;
 
     httpd_uri_t stream_uri = {
         .uri       = "/",
@@ -295,36 +304,39 @@ static httpd_handle_t start_webserver(void)
         .user_ctx  = NULL
     };
 
+    ESP_LOGI(TAG, "Starting HTTP server on port: '%d' on Core %d", config.server_port, config.core_id);
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &stream_uri);
-        ESP_LOGI(TAG, "HTTP Server pornit pe portul 80 (Core 1).");
         return server;
     }
 
-    ESP_LOGE(TAG, "Eroare la pornirea HTTP server.");
+    ESP_LOGE(TAG, "Error starting server!");
     return NULL;
 }
 
 /* ============================================================
- * WIFI SETUP
+ * WIFI EVENT HANDLER & INIT (Hotspot STA Mode)
  * ============================================================ */
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
         esp_wifi_set_ps(WIFI_PS_NONE);
+        ESP_LOGI(TAG, "Wi-Fi associated: Disabled modem sleep (WIFI_PS_NONE)");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGI(TAG, "Disconnected from Wi-Fi, reconnecting...");
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "==================================================");
-        ESP_LOGI(TAG, "CAM CONECTAT!");
-        ESP_LOGI(TAG, "IP Camera: http://" IPSTR "/", IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "CONNECTED! Stream URL: http://" IPSTR "/", IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "==================================================");
+
         esp_wifi_set_ps(WIFI_PS_NONE);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
@@ -341,14 +353,21 @@ static void wifi_init_sta(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
 
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = WIFI_SSID,
             .password = WIFI_PASS,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = false,
+                .required = false
+            },
+            .listen_interval = 0,
         },
     };
 
@@ -356,15 +375,16 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // Max RF output power (78 = 19.5 dBm max) & disable sleep
     esp_wifi_set_max_tx_power(78);
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
 
-    ESP_LOGI(TAG, "Se conecteaza la '%s'...", WIFI_SSID);
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    ESP_LOGI(TAG, "Connecting to hotspot '%s'...", WIFI_SSID);
 }
 
 /* ============================================================
- * MAIN
+ * MAIN ENTRY POINT
  * ============================================================ */
 
 void app_main(void)
@@ -376,13 +396,21 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    ret = init_camera();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Eroare initializare camera.");
+    ESP_LOGI(TAG, "Total Free Internal DRAM: %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "Total Free PSRAM/SPIRAM:  %d bytes", (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+#if ESP_CAMERA_SUPPORTED
+    if (ESP_OK != init_camera()) {
         return;
     }
 
     tune_sensor_quality();
+#endif
+
     wifi_init_sta();
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+
+#if ESP_CAMERA_SUPPORTED
     start_webserver();
+#endif
 }
