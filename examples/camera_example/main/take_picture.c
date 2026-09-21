@@ -56,7 +56,7 @@ static const char *STREAM_PART =
     "Content-Length: %u\r\n\r\n";
 
 /* ============================================================
- * CAMERA CONFIGURATION (SVGA 800x600, 24MHz, Dual Buffer)
+ * CAMERA CONFIGURATION (SVGA 800x600, 24MHz, Triple Buffer)
  * ============================================================ */
 
 #if ESP_CAMERA_SUPPORTED
@@ -87,10 +87,10 @@ static camera_config_t camera_config = {
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_SVGA,       // 800x600 resolution
+    .frame_size = FRAMESIZE_SVGA,
     .jpeg_quality = 12,
 
-    .fb_count = 2,                      // Dual-buffer: always grabs freshest frame
+    .fb_count = 3,                      // 3 buffers in Octal PSRAM prevents FB-OVF under network jitter
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST,
 };
@@ -105,7 +105,6 @@ static esp_err_t init_camera(void)
         return err;
     }
 
-    // Flush initial frame DMA buffers
     for (int i = 0; i < 4; i++) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
@@ -123,32 +122,26 @@ static void tune_sensor_quality(void)
     sensor_t *s = esp_camera_sensor_get();
     if (!s) return;
 
-    // Correct orientation
     s->set_vflip(s, 0);
     s->set_hmirror(s, 1);
 
-    // Color & Contrast: Lift midtones out of the gloomy dark look
-    s->set_brightness(s, 1);            // Boost base exposure level
-    s->set_contrast(s, 1);              // Punchier edges
-    s->set_saturation(s, 1);            // Vibrant natural color
+    s->set_brightness(s, 1);
+    s->set_contrast(s, 1);
+    s->set_saturation(s, 1);
     s->set_sharpness(s, 2);
 
-    // Auto White Balance
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
 
-    // Dynamic Range / Exposure Fix:
-    // Stops the lamp from crushing the whole frame to black
     s->set_exposure_ctrl(s, 1);
-    s->set_aec2(s, 0);                  // Disable secondary AEC (avoids strobe hunting)
-    s->set_ae_level(s, 2);              // Strongly bias exposure brighter (+2)
+    s->set_aec2(s, 0);
+    s->set_ae_level(s, 2);
     s->set_gain_ctrl(s, 1);
-    s->set_gainceiling(s, (gainceiling_t)GAINCEILING_16X); // Lift shadowed room details
+    s->set_gainceiling(s, (gainceiling_t)GAINCEILING_16X);
 
-    // Gamma curve & noise reduction
-    s->set_raw_gma(s, 1);               // Dynamic gamma curves lift shadows
-    s->set_lenc(s, 1);                  // Vignette correction
+    s->set_raw_gma(s, 1);
+    s->set_lenc(s, 1);
     s->set_bpc(s, 1);
     s->set_wpc(s, 1);
 
@@ -171,8 +164,8 @@ static esp_err_t stream_handler(httpd_req_t *req)
         int nodelay = 1;
         setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (const void *)&nodelay, sizeof(nodelay));
 
-        // Send timeout: Drop frame immediately if Wi-Fi has a hiccup
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 250000 };
+        // 2000ms gives adequate headroom for radio airtime jitter without tearing the session down
+        struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
         setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
     }
 
@@ -185,7 +178,6 @@ static esp_err_t stream_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "Client conectat la video stream.");
 
-    // Telemetry tracking variables
     int64_t t_prev_frame = esp_timer_get_time();
     int64_t t_stats_window = esp_timer_get_time();
 
@@ -231,7 +223,6 @@ static esp_err_t stream_handler(httpd_req_t *req)
             break;
         }
 
-        // Telemetry calculation
         int64_t t_now = esp_timer_get_time();
         int64_t gap_us = t_now - t_prev_frame;
         t_prev_frame = t_now;
@@ -249,7 +240,6 @@ static esp_err_t stream_handler(httpd_req_t *req)
             win_stutters++;
         }
 
-        // Output matching 5-second stats to terminal
         if (t_now - t_stats_window >= 5000000) {
             float elapsed_sec = (float)(t_now - t_stats_window) / 1000000.0f;
             float fps = (float)win_frames / elapsed_sec;
@@ -275,7 +265,18 @@ static esp_err_t stream_handler(httpd_req_t *req)
         taskYIELD();
     }
 
-    if (fb) esp_camera_fb_return(fb);
+    if (fb) {
+        esp_camera_fb_return(fb);
+    }
+
+    // Drain and clear pending DMA frame buffers to ensure a clean state
+    for (int i = 0; i < 3; i++) {
+        camera_fb_t *drain_fb = esp_camera_fb_get();
+        if (drain_fb) {
+            esp_camera_fb_return(drain_fb);
+        }
+    }
+
     return res;
 }
 
@@ -295,7 +296,7 @@ static httpd_handle_t start_webserver(void)
     config.core_id = 1;
     config.max_open_sockets = 2;
     config.lru_purge_enable = true;
-    config.send_wait_timeout = 1;
+    config.send_wait_timeout = 3;       // 3 seconds server-side wait before forcing socket purge
 
     httpd_uri_t stream_uri = {
         .uri       = "/",
@@ -375,8 +376,8 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Max RF output power (78 = 19.5 dBm max) & disable sleep
-    esp_wifi_set_max_tx_power(78);
+    // 76 (~19 dBm) keeps transmit power high while protecting 3.3V rail stability
+    esp_wifi_set_max_tx_power(76);
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
 
