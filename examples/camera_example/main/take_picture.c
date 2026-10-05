@@ -28,11 +28,16 @@
 #include "camera_pinout.h"
 
 /* ============================================================
- * WIFI CONFIGURATION (Redmi Note 13 Pro Hotspot)
+ * WIFI CONFIGURATION (Netis N4 AP Bridge Setup)
  * ============================================================ */
 
-#define WIFI_SSID      "My_Redmi"
+#define WIFI_SSID      "Project"
 #define WIFI_PASS      "formula1"
+
+// Static IP layout for Ubuntu bridge (10.42.0.0/24)
+#define STATIC_IP_ADDR "10.42.0.60"
+#define STATIC_GW_ADDR "10.42.0.1"
+#define STATIC_NETMASK "255.255.255.0"
 
 #define WIFI_CONNECTED_BIT BIT0
 
@@ -316,7 +321,7 @@ static httpd_handle_t start_webserver(void)
 }
 
 /* ============================================================
- * WIFI EVENT HANDLER & INIT (Hotspot STA Mode)
+ * WIFI EVENT HANDLER & INIT (Static IP STA Mode)
  * ============================================================ */
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -349,7 +354,17 @@ static void wifi_init_sta(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+
+    // 1. Stop DHCP client to bind static IP immediately
+    ESP_ERROR_CHECK(esp_netif_dhcpc_stop(sta_netif));
+
+    // 2. Set static network parameters for 10.42.0.x subnet
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = esp_ip4addr_aton(STATIC_IP_ADDR);
+    ip_info.gw.addr = esp_ip4addr_aton(STATIC_GW_ADDR);
+    ip_info.netmask.addr = esp_ip4addr_aton(STATIC_NETMASK);
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(sta_netif, &ip_info));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -376,12 +391,12 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // 76 (~19 dBm) keeps transmit power high while protecting 3.3V rail stability
+    // High transmit power with HT20 channel stability
     esp_wifi_set_max_tx_power(76);
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
 
-    ESP_LOGI(TAG, "Connecting to hotspot '%s'...", WIFI_SSID);
+    ESP_LOGI(TAG, "Connecting to AP '%s' with static IP %s...", WIFI_SSID, STATIC_IP_ADDR);
 }
 
 /* ============================================================
